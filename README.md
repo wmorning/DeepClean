@@ -39,7 +39,7 @@ produce the prediction of the current time step.
 Effectively, the RIM cell can be thought of as learning some form of prior as to the appearance of the true images, along with
 an optimization scheme.  It uses the gradient of this prior, along with the gradients of the likelihood to determine an update 
 to maximize the posterior probability of the predicted image.  It does all of this with relatively few parameters for a Neural 
-Network (~500,000), and has been found to be able to generalize quite well (See the Putzky & Welling paper above).
+Network (~500,000 for theirs.  Ours uses more), and has been found to be able to generalize quite well (See the Putzky & Welling paper above).
 
 
 Some neat images, showing the performance of the network on simulated images will appear as this repository develops.  
