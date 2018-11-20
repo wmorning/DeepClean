@@ -6,19 +6,19 @@ Author:  Warren Morningstar
 Interferometers, such as ALMA, measure the fourier transform of the sky.  By inverting this transformation, we are able to make images at unbelievable angular resolution ( approaching milliarcseconds for ALMA or micro-arcseconds for the Event Horizon Telescope).  This angular resolution comes at a significant cost however.  A direct inverse transform will result in a poor quality image.  A few examples of (simulated) ALMA images may be seen below.
 
 <p align="center"> 
-<img src="https://github.com/wmorning/DeepClean_secret/blob/master/images/ALMAims.png">
+<img src="https://github.com/wmorning/DeepClean/blob/master/images/ALMAims.png">
 </p>
 
 Some of the texture is caused by noise, which can be reduced as longer observations are taken.  However, a significant portion occurs simply due to the interferometric observing process.  The incomplete sub-sampling of the fourier transform introduces a smearing analogous to a point spread function from optical astronomy.  We call this the synthesized beam (or sometimes the dirty beam).  Depending on how your interferometer is set up, how long it observes, and where it points on the sky, the synthesized beam can be radically different, leading to the same image posessing significant variety, as shown below.
 
 <p align="center"> 
-<img src="https://github.com/wmorning/DeepClean_secret/blob/master/images/ALMAims2.png">
+<img src="https://github.com/wmorning/DeepClean/blob/master/images/ALMAims2.png">
 </p>
 
 Many astronomical analyses of Interferometric images rely on some form  of method to remove the synthesized beam.   The most commonly used method for this is the CLEAN algorithm. CLEAN works by iteratively subtracting point sources convolved with the dirty beam from the image, until a user-defined stopping criterion is met.  This can be a problem for a number of reasons:  1)  It can require active supervision to achieve acceptable results.  2)  It makes erroneous assumptions about the structure of the source.  3)  It can be difficult to perform without a substantial amount of practice.
 
 <p align="center"> 
-<img src="https://github.com/wmorning/DeepClean_secret/blob/master/images/CLEAN_sequence.png">
+<img src="https://github.com/wmorning/DeepClean/blob/master/images/CLEAN_sequence.png">
 
 Above is an example of CLEAN in practice.  For this, I used real ALMA observations of a gravitational lens, and personally supervised the whole process (I should note that I am a novice to CLEAN, and better performance may be found if an expert were to do this instead of me).  CLEAN works as follows:  
 
@@ -37,13 +37,13 @@ The measurement of an image by an Interferometer can be thought of as a form of 
 The network I use is a [Recurrent Inference Machine](http://sbt.science.uva.nl/mri/author/mri/) by  [Putzky & Welling (2017)](https://arxiv.org/abs/1706.04008).  This is a specialized form of Convolutional Recurrent Neural  Network that is designed to solve inverse problems of the form described above.  Specifically, inverse problems for which the  form of corruption is known, and thus a forward model can be constructed.  At each time step in the recurrent network, a  prediction as to the true underlying image is made by the network. The inputs to the current time step are the prediction from  the previous time step, as well as the gradient of the likelihood of that predicted image (given the observed image) with  respect to itself.  The RIM takes these images, and (with the help of an internal memory state that is updated at each  time step as well) produces an update to its prediction, which it adds to the prediction from the previous time step to  produce the prediction of the current time step.  A diagram of the RIM is shown below:
 
 <p align="center"> 
-<img src="https://github.com/wmorning/DeepClean_secret/blob/master/images/RIM_diagram2.png" width="50%">
+<img src="https://github.com/wmorning/DeepClean/blob/master/images/RIM_diagram2.png" width="50%">
 </p>
 
 the image x&#770;<sub>t-1</sub> is given to the network, along with the gradient of the log-likelihood of the data given x&#770;<sub>t-1</sub>.  This network then produces an update rule &Delta;x&#770;<sub>t</sub> which is used to get x&#770;<sub>t</sub>.  It also updates a hidden state h<sub>t</sub> which is used by the CRNN to allow it to exhibit more dynamic temporal behavior.  After a number of time steps, the output image x&#770;<sub>t</sub> is taken to be the deconvolved image.  We train by minimizing the squared error of this output image.
 
 <p align="center"> 
-<img src="https://github.com/wmorning/DeepClean_secret/blob/master/images/RIM_time_sequence.png" >
+<img src="https://github.com/wmorning/DeepClean/blob/master/images/RIM_time_sequence.png" >
 </p>
 
 Effectively, the RIM cell can be thought of as learning some form of prior as to the appearance of the true images, along with an optimization scheme.  It uses the gradient of this prior, along with the gradients of the likelihood to determine an update  to maximize the posterior probability of the predicted image.  It does all of this with relatively few parameters for a Neural  Network (~500,000 for theirs.  Ours uses more), and has been found to be able to generalize quite well (See the Putzky &  Welling paper above).
@@ -56,7 +56,7 @@ hundreds of thousands of simulated (and only simulated) lenses, the RIM has lear
 reconstruction.
 
 <p align="center"> 
-<img src="https://github.com/wmorning/DeepClean_secret/blob/master/images/SPT0529_realtime.gif">
+<img src="https://github.com/wmorning/DeepClean/blob/master/images/SPT0529_realtime.gif">
 </p>
 
 What we see is that it initially identifies the most probable locations of emission and adds flux to those locations.  It then
