@@ -62,3 +62,24 @@ reconstruction.
 What we see is that it initially identifies the most probable locations of emission and adds flux to those locations.  It then
 adjusts its model to identify dimmer sources and to correct the morphology of the bright clumps.  The end result is a 
 substantially cleaned version of the image.
+
+This is all good for reconstructing images of lenses that have 0.04 arcsecond pixel sizes, and are 192 by 192 pixels.  
+However, most sources in the universe are not lenses, and many ALMA configurations do not really observe at this exact range 
+of resolutions.  The question that I'm leading to here is:  How does this network perform on observations that it was not 
+originally designed to analyze?  This is obviously an valid question, since traditionally machine learning methods perform 
+substantially worse outside of the distribution of data covered by their training set.  We wanted to test this (slightly), so 
+what we've done is to make a synthetic ALMA observation of a non-gravitationally lensed nearby galaxy.  For this, we use the 
+spiral galaxy M51, where the image for the source was found [here](https://casaguides.nrao.edu/index.php/Simalma_(CASA_4.1)).
+If you download this image, you'll notice that it is both not a gravitational lens, and not 192x192 pixels.  So it is well 
+outside of the training data distribution.  We then created visibilities and fed them to the network.  The reconstruction is 
+shown below.
+
+<p align="center"> 
+<img src="https://github.com/wmorning/DeepClean/blob/master/images/CLEAN_generalization.png">
+</p>
+
+Did it do perfect?  Absolutely not.  But it did much better than random guessing.  It recovers the spiral structure for 
+example.  That is pretty amazing, given that this network has never seen a single image of a non-lensed galaxy, nor one with 
+so many pixels and such compact and complex structure.  Perhaps even more importantly, it does not spuriously add structure 
+everywhere.  We will continue to study this potential, as well as trying to utilize a more comprehensive training set, so that 
+we do not limit ourselves to images of gravitational lenses.  Stay tuned!
