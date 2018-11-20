@@ -25,40 +25,16 @@ class ALMA_sampler(object):
     images.
 
     '''
-    def __init__(self,img_pl,UVGRID,noise,gridded_vis_input=False):
+    def __init__(self,img_pl,UVGRID,noise,noise_std,gridded_vis_input=False,full_dim=False):
         '''
         Initialize the object.  Lets have img_pl be the shape we expect to be fed to the network [m,N,N,1]
-        and do transposing to reshape things as we need.  Note that if gridded visibilities are used img_pl
-        should be the same shape as UVGRID and noise (both of which are also placeholders).
-
-        The noise placeholder is used so that noise can be added to data during training, if visibilities are
-        used, noise will not ever enter into the observed images or anything (so it can safely be ignored).
-
-        A future version of this will explicitly calculate the chi2 of the observed visibilities given the
-        image.  What we have right now is proportional to this (given that all visibilities have the same
-        noise), but it is not scaled properly.  For the best possible work, this should be fixed.  
-        
-        ------------------------------------------------------------
-        Inputs:
-
-        img_pl:    A placeholder either for the true image (for training), or for the observed visibilities
-                   (when using the network as a prediction machine).
-
-        UVGRID:    A placeholder for the uv sampling (in grid form)  for training, it should be 2x as large
-                   as the img_pl, and for prediction, it should be the same size.
-        
-        noise:     A placeholder for the noise to be added during training.  It should be the same shape as 
-                   the uv grid (note that it will not be used given visibility data).
-
-        gridded_vis_input:    A boolean declaring if the input img_pl is gridded visibilities or an image.
-
+        and do transposing to reshape things as we need.
         '''
 
         self.vis_input = gridded_vis_input
 
-        if gridded_vis_input is False:  # data is an image, so we'll have to FT to get visibilities.
-            
-            # padding the image helps us get a more accurate approximation to the beam.
+        if gridded_vis_input is False:
+
             N,H,W,C  = img_pl.get_shape().as_list()
             padding = tf.constant([[0,0],[H/2,H/2],[W/2,W/2],[0,0]])
 
@@ -66,101 +42,162 @@ class ALMA_sampler(object):
             img = tf.cast(img_pl,tf.complex64)
             img = tf.pad(img,padding)
             img = tf.transpose(img,[0,3,1,2])
+            
+            # Expected noise on an unbinned visibility is the standard deviation of the real noise * sqrt(2)
+            self.noise_std = noise_std 
+            
             noise = tf.transpose(tf.cast(noise,tf.complex64),[0,3,1,2])
             UVGRID = tf.transpose(UVGRID,[0,3,1,2])
 
-            # normalization factor for FFT
-            self.N = tf.cast(tf.to_float(tf.reduce_prod(tf.shape(img_pl)[-2:])),dtype=tf.complex64)
+            # normalization factor
+            self.N = tf.cast(tf.to_float(tf.reduce_prod(tf.shape(img_pl)[-3:])),dtype=tf.complex64)
+            self.N2 = tf.cast(tf.to_float(tf.reduce_prod(tf.shape(noise)[-2:])),dtype=tf.complex64)
         
-            # FT to get all possible visibilities
+            # All of the visibilities
             self.vis_full_exact = tf.fft2d(img) / tf.cast(tf.sqrt(self.N),dtype=tf.complex64)
-            
-            # noise was given in real space, lets move it to Fourier space as well.
-            noise_ft = tf.fft2d(noise) / tf.sqrt(self.N)
-            
-            # Scale the noise by 1/sqrt of the number of baselines in each cell. Avoid div by 0 for unsampled cells
+            noise_ft = tf.fft2d(noise) / tf.sqrt(self.N2)
             noise_uv = tf.divide(noise_ft,tf.add(tf.sqrt(tf.cast(UVGRID,tf.complex64)),tf.constant(1e-10,dtype=tf.complex64)))
-            
-            # All possible noisy visibilities (including ones that will not be sampled)
             self.vis_full_noisy = tf.add(self.vis_full_exact,noise_uv)
-        
-        else: # visibilities were provided, so comparatively less processing must be done.
 
-            # the shape has to change to align with the forward model
+            # Lets create a uv mask to avoid divisions by zero.
+            self.uvmask  = tf.cast(tf.not_equal(UVGRID,tf.constant(0)),tf.int32)
+            vis_bad2,self.noise_ft = tf.dynamic_partition(noise_ft,self.uvmask,num_partitions=2)
+            
+        else:
+            # We're using gridded visibilities, so the sizes will work out a bit differently
             self.vis_full_noisy = tf.transpose(img_pl,[0,3,1,2])
-            
-            # For now, we just need an N, so lets use the pixscale we trained on...
             self.N = tf.cast(192.0,dtype=tf.complex64)
-            
-            # switching dims for compatibility... again.
             UVGRID = tf.transpose(UVGRID,[0,3,1,2])
-
-            # Is this even necessary?
             noise = tf.transpose(tf.cast(noise,tf.complex64),[0,3,1,2])
+            self.uvmask  = tf.cast(tf.not_equal(UVGRID,tf.constant(0)),tf.int32)
 
-        # We can use a mask to avoid divisions by zero later on.  Also lets mask everything we can.
-        self.uvmask  = tf.cast(tf.not_equal(UVGRID,tf.constant(0)),tf.int32)
+        # Select only visibilities that have been measured
         vis_bad2,self.vis_noisy= tf.dynamic_partition(self.vis_full_noisy,self.uvmask,num_partitions=2)
+
+        # Select only uv cells that have at least one baseline
         ignored_bl,self.UVGRID = tf.dynamic_partition(UVGRID,self.uvmask,num_partitions=2)
         
-        # for imaging purposes
+        # Scale the noise to correspond with each baseline
+        self.sigma = self.noise_std / tf.sqrt(tf.cast(self.UVGRID,tf.float32))
+        
+        # This is for dirty image computation
         self.UVGRID_full = tf.cast(UVGRID,tf.complex64)
+
+        # If we didn't supply visibilities, we can use this for visualization of noiseless images
+        if gridded_vis_input is False:
+            self.vis_full_sampled = tf.multiply(self.vis_full_exact,tf.cast(self.uvmask,tf.complex64))
+
+        # Set non-measured baselines to zero for imaging purposes.
         self.vis_full_sampled_noisy = tf.multiply(self.vis_full_noisy,tf.cast(self.uvmask,tf.complex64))
 
-        # define the dirty image as part of the graph.
-        self.DIM = self.get_noisy_dirty_image()
+        # Tensor for the dirty images.
+        self.DIM = self.get_noisy_dirty_image(return_full=full_dim)
+
         
-
-    def get_noiseless_dirty_image(self):
-        # I'm not going to really do anything with this, but its here.
-        return tf.transpose(tf.real(tf.ifft2d(self.vis_full_sampled) * tf.cast(tf.sqrt(self.N),dtype=tf.complex64)),[0,2,3,1])[:,192/2:3*192/2,192/2:3*192/2,:]      
-
-    def get_noisy_dirty_image(self,weighting='natural'):
-        # the output image varies depending on how it is weighted.
+    def get_noiseless_dirty_image(self,weighting='natural'):
+        '''
+        This function produces a noise-free dirty image from simulated data.  It can do both uniform and
+        naturally weighted images, and is used mostly for debugging purposes.
+        '''
         if weighting == 'uniform':
-            return tf.transpose(tf.real(tf.ifft2d(self.vis_full_sampled_noisy)*tf.cast(tf.sqrt(self.N),dtype=tf.complex64)),[0,2,3,1])[:,192/2:3*192/2,192/2:3*192/2,:]
+            return tf.transpose(tf.real(tf.ifft2d(self.vis_full_sampled) * \
+                                tf.cast(tf.sqrt(self.N),dtype=tf.complex64)) , \
+                                [0,2,3,1])[:,192/2:3*192/2,192/2:3*192/2,:]
         else:
             if self.vis_input:
-                dim_full = tf.transpose(tf_fftshift(tf.real(tf.ifft2d(tf.multiply(self.vis_full_sampled_noisy,tf.cast(self.UVGRID_full,dtype=tf.complex64)))*tf.cast(tf.sqrt(self.N),dtype=tf.complex64))),[0,2,3,1])
+                dim_full_noiseless = tf.transpose(tf_fftshift(tf.real(tf.ifft2d(tf.multiply(self.vis_full_sampled,\
+                                                  tf.cast(self.UVGRID_full,dtype=tf.complex64))) * \
+                                                  tf.cast(tf.sqrt(self.N),dtype=tf.complex64))),[0,2,3,1])
             else:
-                dim_full = tf.transpose(tf.real(tf.ifft2d(tf.multiply(self.vis_full_sampled_noisy,tf.cast(self.UVGRID_full,dtype=tf.complex64)))*tf.cast(tf.sqrt(self.N),dtype=tf.complex64)),[0,2,3,1])
+                dim_full_noiseless = tf.transpose(tf.real(tf.ifft2d(tf.multiply(self.vis_full_sampled,\
+                                                  tf.cast(self.UVGRID_full,dtype=tf.complex64))) * \
+                                                  tf.cast(tf.sqrt(self.N),dtype=tf.complex64)),[0,2,3,1])
+            N,H,W,C = dim_full_noiseless.get_shape().as_list()
+            return dim_full_noiseless[:,H/2-192/2:H/2+192/2,W/2-192/2:W/2+192/2,:]
+        
+
+
+    def get_noisy_dirty_image(self,weighting='natural',return_full=False):
+        if weighting == 'uniform':
+            return tf.transpose(tf.real(tf.ifft2d(self.vis_full_sampled_noisy) * \
+                                tf.cast(tf.sqrt(self.N),dtype=tf.complex64)) , 
+                                [0,2,3,1])[:,192/2:3*192/2,192/2:3*192/2,:]
+        else:
+            if self.vis_input:
+                dim_full = tf.transpose(tf_fftshift(tf.real(tf.ifft2d(tf.multiply(self.vis_full_sampled_noisy,\
+                                        tf.cast(self.UVGRID_full,dtype=tf.complex64))) * \
+                                        tf.cast(tf.sqrt(self.N),dtype=tf.complex64))),[0,2,3,1])
+            else:
+                dim_full = tf.transpose(tf.real(tf.ifft2d(tf.multiply(self.vis_full_sampled_noisy,\
+                                        tf.cast(self.UVGRID_full,dtype=tf.complex64))) * \
+                                        tf.cast(tf.sqrt(self.N),dtype=tf.complex64)),[0,2,3,1])
+            
             N,H,W,C  = dim_full.get_shape().as_list()
-            return dim_full[:,H/2-192/2:H/2+192/2,W/2-192/2:W/2+192/2,:]
+            
+            if return_full == False:
+                # return only the center 192 pixels (this is temporary)
+                return dim_full[:,H/2-192/2:H/2+192/2,W/2-192/2:W/2+192/2,:]
+            else:
+                return dim_full
             
         
     def loglikelihood(self,img_pred):
         '''
-        Given a set of visibilities (either given via an image plus uv sampling or by observed visibilities),
-        calculate the loglikelihood (chi2) of an input image.
-
-        Right now, this is proportional to the chi2, but it is not strictly correct.  This is mainly
-        due to the difficulty in interpreting the input noise correctly (because of the FFT).  For
-        real visibility data, we know the expected noise, so this would be trivial.
-
-        Either way, for the RIM, this should be used in the gradient function (specifically, with tf.gradients).
-        
+        This is the log-likelihood of the model.  It is computed via a fourier transform
+        of the image, then a selection of the visibilities that were measured, a subtraction
+        from the observed signal, and a scaling by the expected noise.
         '''
-        # get sizes, and pad/reshape  accordingly
+        
+        # This handles the padding dimensions.
         N,C,H,W  = self.vis_full_noisy.get_shape().as_list()
-        N2,H2,W2,C2 = img_pred.get_shape().as_list()            
-        padding = tf.constant([[0,0],[(H-H2)/2,(H-H2)/2],[(W-W2)/2,(W-W2)/2],[0,0]])        
+        N2,H2,W2,C2 = img_pred.get_shape().as_list()
+        
+        # this is the size of the padding
+        padding = tf.constant([[0,0],[(H-H2)/2,(H-H2)/2],[(W-W2)/2,(W-W2)/2],[0,0]])
+        
+        # Pad the visibilities, and transpose for FFT
         img_pred = tf.pad(tf.cast(img_pred,dtype=tf.complex64),padding)
         img_pred = tf.transpose(img_pred,[0,3,1,2])
-
-        if self.vis_input:
-            # the center of the image is our origin, therefore use an fftshift to enforce this with real data.
-            img_pred = tf_fftshift(img_pred)
-            
-        # Forward model the visibilities
-        vis_pred_full = tf.fft2d(img_pred) / tf.cast(tf.sqrt(self.N),dtype=tf.complex64)
-        temp,vis_pred = tf.dynamic_partition(vis_pred_full,self.uvmask,num_partitions=2)
         
-        # visibility residuals
+        # If we specified gridded visibilities, then we need to fftshift 
+        # because FFTs assume the center is in the upper left corner...
+        if self.vis_input:
+            img_pred = tf_fftshift(img_pred)
+
+        # FFT the image and normalize
+        vis_pred_full = tf.fft2d(img_pred) / tf.cast(tf.sqrt(self.N),dtype=tf.complex64)
+
+        # Dynamic partition to select out the measured baselines
+        temp,vis_pred = tf.dynamic_partition(vis_pred_full,self.uvmask,num_partitions=2)
+
+        # Compute the residual error
         difference = tf.subtract(vis_pred,self.vis_noisy)
         
-        # chi2 is proportional to the squared residuals over the squared noise relative scale
-        chi2 = tf.reduce_sum(tf.multiply(tf.square(tf.abs(difference)) , tf.cast(self.UVGRID,tf.float32)))
+        # Scale by the noise and sum to get the chi-squared
+        chi2 = tf.reduce_sum(tf.divide(tf.square(tf.abs(difference)) , tf.square(self.sigma)))
         return chi2
+
+    def predicted_DIM(self,img_pred):
+        '''
+        A function to predict the dirty image from an image
+        '''
+        N,C,H,W  = self.vis_full_noisy.get_shape().as_list()
+        N2,H2,W2,C2 = img_pred.get_shape().as_list()
+
+        padding = tf.constant([[0,0],[(H-H2)/2,(H-H2)/2],[(W-W2)/2,(W-W2)/2],[0,0]])
+
+        img_pred = tf.pad(tf.cast(img_pred,dtype=tf.complex64),padding)
+        img_pred = tf.transpose(img_pred,[0,3,1,2])
+        if self.vis_input:
+            img_pred = tf_fftshift(img_pred)
+
+        vis_pred_full = tf.fft2d(img_pred) / tf.cast(tf.sqrt(self.N),dtype=tf.complex64)
+        dim_full = tf.transpose(tf.real(tf.ifft2d(tf.multiply(vis_pred_full , \
+                                tf.cast(self.UVGRID_full,dtype=tf.complex64))) * \
+                                tf.cast(tf.sqrt(self.N),dtype=tf.complex64)),[0,2,3,1])
+
+        # Dimensions are the same shape as the input image.
+        return dim_full[:,H/2-H2/2:H/2+H2/2,W/2-W2/2:W/2+W2/2,:]
 
 
 

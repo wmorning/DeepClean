@@ -1,12 +1,11 @@
 import numpy as np
 from PIL import Image
 import os,sys
-from sim_uv_cov import get_new_UVGRID_and_db
+import DeepClean as DC
 import struct
-import glob
 
 
-# If we're importing functions from here, then we need all of this defined locally...
+# WHY DID WE HAVE TO WRITE IT THIS WAY!!!!!!!!!!!!!!!!
 numpix_side = 192
 batch_size = 2
 pix_res = 0.04
@@ -16,7 +15,7 @@ max_trainoise_rms = 0.1
 max_testnoise_rms = 0.1
 max_noise_rms = max_testnoise_rms
 cycle_batch_size = 10
-num_test_samples = 1000
+num_test_samples = 500
 global arcs_data_path_1, arcs_data_path_2 , test_data_path_1 , test_data_path_2 , CRay_data_path
 global lens_data_path_1, lens_data_path_2, testlens_data_path_1, testlens_data_path_2
 global min_unmasked_flux
@@ -43,26 +42,20 @@ Y_all_test[1] = np.loadtxt(test_data_path_2 + '/parameters_test.txt')
 R_n = np.loadtxt( os.environ['WORK'] + '/DATA/PS_4_real.txt')
 I_n = np.loadtxt( os.environ['WORK'] + '/DATA/PS_4_imag.txt')
 
-CLEAN_data_paths = [os.environ['WORK']+'/DATA/RIM/',\
-		    os.environ['WORK']+'/DATA/RIM2/',\
-		    os.environ['WORK']+'/DATA/RIM3/',\
-		    os.environ['WORK']+'/DATA/RIM4/',\
-		    os.environ['WORK']+'/DATA/RIM5/',\
-		    os.environ['WORK']+'/DATA/RIM6/',\
-		    os.environ['WORK']+'/DATA/RIM7/',\
-		    os.environ['WORK']+'/DATA/RIM8/',\
-		    os.environ['WORK']+'/DATA/RIM9/']
-
-
-Y_CLEAN_train = [[],[],[],[],[],[],[],[],[],[]]
-for i in range(9):
-	Y_CLEAN_train[i]=np.load(CLEAN_data_paths[i]+'parameters_train.npy')
-
-
-
 
 xv, yv = np.meshgrid( np.linspace(-L_side/2.0, L_side/2.0, num=numpix_side) ,  np.linspace(-L_side/2.0, L_side/2.0, num=numpix_side))
 
+
+def read_batch_online( X , Y , max_file_num , train_or_test):
+	num_samp = X.shape[0]
+	Xmat, Ymat = eng.online_image_generator(num_samp , -1 , numpix_side , os.environ['LOCAL_SCRATCH'] , nargout=2)
+	Xmat = np.array(Xmat._data.tolist())
+	Xmat = Xmat.reshape((num_samp,numpix_side,numpix_side))
+	Xmat = np.transpose(Xmat, axes=(0,2,1)).reshape((num_samp,numpix_side*numpix_side))
+	Ymat = np.array(Ymat._data.tolist())
+	Ymat = Ymat.reshape((num_out,num_samp)).transpose()
+	X[:] = Xmat
+	Y[:] = Ymat
 
 
 def make_real_noise(Fmap):
@@ -98,6 +91,76 @@ def add_gaussian_noise(im):
 
 
 
+def gen_masks(nmax,ARCS , apply_prob=0.5):
+        mask = 1.0
+	if np.min(ARCS)<0.1 and np.max(ARCS)>0.9:
+        	if np.random.uniform(low=0, high=1)<=apply_prob:
+			while True:
+                		mask = np.ones((numpix_side,numpix_side),dtype='float32')
+                		num_mask = np.random.randint(1, high = nmax)
+                		for j in range(num_mask):
+                        		x_mask =  np.random.uniform(low=-L_side/2.0, high=L_side/2.0)
+                        		y_mask =  np.random.uniform(low=-L_side/2.0, high=L_side/2.0)
+                        		r_mask = np.sqrt( (xv- x_mask  )**2 + (yv- y_mask )**2 )
+                        		mask_rad = 0.2
+                        		mask = mask * np.float32(r_mask>mask_rad)
+				if np.sum(mask*ARCS) >= ( min_unmasked_flux * np.sum(ARCS)):
+					break
+	return mask
+
+
+def apply_psf(im , my_max_psf_rms , apply_prob=1.0 ):
+        np.random.uniform()
+        rand_state = np.random.get_state()
+	if np.random.uniform()<= apply_prob:
+    		psf_rms = np.random.uniform(low= 0.1 , high=my_max_psf_rms)
+    		blurred_im = scipy.ndimage.filters.gaussian_filter( im.reshape(numpix_side,numpix_side) , psf_rms)
+		if np.max(blurred_im)!=0:
+    			blurred_im = blurred_im / np.max(blurred_im)
+    		im[:] = blurred_im.reshape((-1,numpix_side*numpix_side))
+	np.random.set_state(rand_state)
+
+
+def add_poisson_noise(im,apply_prob=1):
+	np.random.uniform()
+	rand_state = np.random.get_state()
+	if np.random.uniform()<= apply_prob:
+		intensity_to_photoncounts = np.random.uniform(low=50.0, high=1000.0)
+		photon_count_im = np.abs(im * intensity_to_photoncounts)
+		poisson_noisy_im = np.random.poisson(lam=(photon_count_im), size=None)
+		im_noisy = np.double(poisson_noisy_im)/intensity_to_photoncounts 
+		im_noisy = im_noisy/np.max(im_noisy)
+		im[:] = im_noisy
+	np.random.set_state(rand_state)
+
+
+def add_cosmic_ray(im,apply_prob=1):
+	rand_state = np.random.get_state()
+	if np.random.uniform()<= apply_prob:
+		inds_cr = np.random.randint(0, high = 400000)
+		filename_cr =  CRay_data_path + 'cosmicray_' + "%07d" % (inds_cr+1) + '.png'
+		CR_MAP = np.array(Image.open(filename_cr),dtype='float32').reshape(numpix_side*numpix_side,)/255.0
+		if np.max(CR_MAP)>0.1 and np.min(CR_MAP)<0.1:
+			CR_MAP = CR_MAP/np.max(CR_MAP)
+		else:
+			CR_MAP = CR_MAP * 0
+		CR_SCALE = np.random.uniform(low=0.0, high=max_cr_intensity)
+		im[:] = im[:] + (CR_SCALE * CR_MAP)
+	np.random.set_state(rand_state)
+
+def pixellation(im_input):
+        im = np.max(im_input)
+        im =  im.reshape(numpix_side,numpix_side)
+        numccdpix = np.random.randint(96, high=192)
+        FACTOR = np.float( numccdpix)/192.0
+        im_ccd =scipy.ndimage.interpolation.zoom( im , FACTOR )
+        im_ccd_max = np.max(im_ccd)
+        im_ccd = im_ccd * im_max / im_ccd_max
+        add_gaussian_noise(im_ccd)
+        im = scipy.ndimage.interpolation.zoom( im_ccd , 1/FACTOR )
+        im = im * im_max / np.max(im)
+	im_input[:] = im
+
 
 def im_shift(im, m , n):
     shifted_im1 = np.zeros(im.shape)
@@ -130,19 +193,15 @@ def pick_new_lens_center(ARCS,Y, xy_range = 0.5):
 	np.random.set_state(rand_state)
 	return shifted_ARCS , lensXY , m_shift, n_shift
 
-
-def read_data_batch( X , PSF, Y , noise, max_file_num , train_or_test,uvconfig=None):
-    '''
-    Read a batch of data.  Can be either train or test data.
-    '''
+def read_data_batch( X , PSF, Y , noise, max_file_num , train_or_test,returnuv = False,antennaconfig=None):
     batch_size = len(X)
-    if train_or_test=='test': # if test data, it should be deterministic.  So lets use a random seed.
+    #mag = np.zeros((batch_size,1))
+    if train_or_test=='test':
         inds = range(batch_size)
         np.random.seed(seed=2)
 	d_path = [[],[]]
 	d_path[0] = test_data_path_1
 	d_path[1] = test_data_path_2
-	
 
     else:
         np.random.seed(seed=None)
@@ -151,9 +210,15 @@ def read_data_batch( X , PSF, Y , noise, max_file_num , train_or_test,uvconfig=N
         d_path[0] = arcs_data_path_1
         d_path[1] = arcs_data_path_2
 
+
     image_container = np.zeros([numpix_side,numpix_side])
+    U = []
+    V = []
 
     for i in range(batch_size):
+
+        #ARCS=1
+        #nt = 0
 
 	while True:
         	ARCS=1
@@ -176,10 +241,10 @@ def read_data_batch( X , PSF, Y , noise, max_file_num , train_or_test,uvconfig=N
 					Y[i,0:8] = Y_all_train[pick_folder][inds[i],0:8]
 					Y[i,7] = Y[i,7]/16.
 
-				# get the image from the disk
+
 				ARCS = np.array(Image.open(arc_filename),dtype='float32').reshape(numpix_side*numpix_side,)/65535.0
 
-		# Randomly shift the position of the lens to boost the training volume.
+
 		ARCS_SHIFTED, lensXY , m_shift, n_shift = pick_new_lens_center(ARCS,Y[i,:], xy_range = max_xy_range)
 
 		ARCS = np.copy(ARCS_SHIFTED).reshape(numpix_side,numpix_side) 
@@ -188,159 +253,259 @@ def read_data_batch( X , PSF, Y , noise, max_file_num , train_or_test,uvconfig=N
                 if (np.all(np.isnan(ARCS)==False)) and ((np.all(ARCS>=0)) and (np.all(np.isnan(Y[i,3:5])==False))) and ~np.all(ARCS==0):
                         break
 
-	rand_state = np.random.get_state()
+        rand_state = np.random.get_state()
 
 	im_telescope = np.copy(ARCS) 
 	im_telescope = im_telescope.reshape((numpix_side,numpix_side))
-	
-	# Generate an ALMA configuration
-	UVGRID,db = get_new_UVGRID_and_db(pix_res,numpix_side*2,deposit_order=0,antennaconfig=uvconfig)
+
+
+	UVGRID,db,u,v = DC.get_new_UVGRID_and_db(pix_res,numpix_side*2,deposit_order=0,antennaconfig=antennaconfig)
 
 	if np.any(ARCS>0.4):
         	val_to_normalize = np.max(im_telescope[ARCS>0.4])
 		if val_to_normalize==0:
 			val_to_normalize = 1.0
-		int_mult = np.random.normal(loc=1.0, scale = 0.01)
+		int_mult = 1.0-abs(np.random.normal(loc=0.0, scale = 0.01))
         	im_telescope = (im_telescope / val_to_normalize) * int_mult 
 	
-	# Draw a scaling for the noise.
-	noise_scl = np.random.uniform(max_noise_rms/100.,max_noise_rms)
+	noise_scl = np.random.uniform(max_noise_rms/10.,max_noise_rms)
+#	noise[i,:] = np.random.normal(0.0,noise_scl*np.max(im_telescope)*np.sqrt(2),UVGRID.shape).reshape(1,2*numpix_side,2*numpix_side,1)
 	
-	# To actually scale the noise, we need to create the image, and then get the other components of the scaling.
-	dim_telescope = np.fft.ifft2(np.fft.fft2(np.pad(im_telescope,[[numpix_side/2,numpix_side/2],[numpix_side/2,numpix_side/2]],mode='constant',constant_values=0.))*np.fft.fftshift(UVGRID>0)).real
+	dim_telescope = np.fft.ifft2(np.fft.fft2(np.pad(im_telescope,[[numpix_side/2,numpix_side/2],[numpix_side/2,numpix_side/2]],mode='constant',constant_values=0.))*np.fft.fftshift(UVGRID>0)/192.).real
 	noise_realization = np.random.normal(0.0,1.0,UVGRID.shape)
-
-	# This is now the correlated noise that would be present in the ALMA observation.
-	noise_dty = np.fft.ifft2(np.fft.fft2(noise_realization)/np.sqrt(np.fft.fftshift(UVGRID)+10**-8)*(np.fft.fftshift(UVGRID>0))).real
-	# scale the noise and add it to the outputs
-	noise[i,:] = noise_realization.reshape(1,2*numpix_side,2*numpix_side,1) * np.max(dim_telescope)/np.std(noise_dty) / np.sqrt(2) * noise_scl
+	noise_dty = np.fft.ifft2(np.fft.fft2(noise_realization)/np.sqrt(np.fft.fftshift(UVGRID)+10**-8)*(np.fft.fftshift(UVGRID>0))/384.).real
+	noise[i,:] = noise_realization.reshape(1,2*numpix_side,2*numpix_side,1) * np.max(dim_telescope)/np.std(noise_dty)*noise_scl
 	
-	# add the image to the outputs
-        X[i,:] = im_telescope.reshape((1,-1))
+	
 
-	# add the uv sampling to the outputs
+        X[i,:] = im_telescope.reshape((1,-1))
 	PSF[i,:] = np.fft.fftshift(UVGRID).reshape((1,numpix_side*2,numpix_side*2,1))
-       	
-	# update the shifted position of the lens.
-	Y[i,3] = lensXY[0]
+       	Y[i,3] = lensXY[0]
        	Y[i,4] = lensXY[1]
 
 	np.random.set_state(rand_state)
+	
+	if returnuv:
+		U.append(u)
+		V.append(v)
 
+    if returnuv:
+	    return U,V
 
-
-def read_test_data(uvconfig=None):
-
-    #mag = np.zeros((batch_size,1))                                                                                                    
-    train_or_test = 'test'
-
-    np.random.seed(seed=2)
-    d_path = [[],[]]
-    d_path[0] = test_data_path_1
-    d_path[1] = test_data_path_2
-    bad_data1 = np.loadtxt(os.environ['WORK']+'/NAZGUL/ARCS_1/arcs1_ignore.txt')
-    bad_data2 = np.loadtxt(os.environ['WORK']+'/NAZGUL/ARCS_2/arcs2_ignore.txt')
-
-    
-    image_container = np.zeros([numpix_side,numpix_side])
-    
-    fileslist = []
-    for i in range(1000):
-	    # go through all files and select the ones that are acceptable
-	    if not i+1 in bad_data1:
-		    fileslist.append([0,i+1])
-	    else:
-		    pass
-	    if not i+1 in bad_data2:
-		    fileslist.append([1,i+1])
-	    else:
-		    pass
-
-    batch_size = len(fileslist) 
-    X = np.zeros([batch_size,numpix_side**2])
-    Y = np.zeros([batch_size,num_out])
-    PSF = np.zeros([batch_size,2*numpix_side,2*numpix_side,1])
-    noise = np.zeros([batch_size,2*numpix_side,2*numpix_side,1])
+def read_test_data_batch( X , PSF , Y_test , Y_CLEAN ):
+    batch_size = len(X)
     inds = range(batch_size)
-    
-    print "batch size:  " , batch_size
-
     for i in range(batch_size):
-	    print("image {0} out of {1}".format(i,batch_size))
-	    while True:
-                ARCS=1
-                nt = 0
-                while np.min(ARCS)==1 or np.max(ARCS)<0.4:
-                        nt = nt + 1
-                        if nt>1:
-                                #inds[i] = np.random.randint(0, high = max_file_num)
-				
-				print nt
-				
-                        #pick_folder = np.random.randint(0, high = num_data_dirs)
-                        arc_filename = d_path[fileslist[i][0]] +  train_or_test + '_' + "%07d" % (fileslist[i][1]) + '.png'
-			print arc_filename
-                        if os.path.isfile(arc_filename):
-                                if train_or_test=='test':
-                                        Y[i,0:8] = Y_all_test[fileslist[i][0]][fileslist[i][1]-1,0:8]
-                                        Y[i,7] = Y[i,7]/16.
+        filename = os.environ['SCRATCH'] + "/CASA_IMS/dirty_im_sim_" + "%03d" % (i+1) + '.fits'
+        hdulist = fits.open(filename)
+        im = hdulist[0].data
+	X[i,:] = im.reshape((1,-1))
 
-#                                else:
-#                                        Y[i,0:8] = Y_all_train[pick_folder][inds[i],0:8]
-#                                        Y[i,7] = Y[i,7]/16.
+        filename = os.environ['SCRATCH'] + "/CASA_IMS/psf_sim_" + "%03d" % (i+1) + '.fits'
+	hdulist = fits.open(filename)
+        im = hdulist[0].data
+        PSF[i,:] = im.reshape((1,-1))
+
+        filename = os.environ['SCRATCH'] + "/CASA_IMS/im_" + "%03d" % (i+1) + '.fits'
+        hdulist = fits.open(filename)
+        im = hdulist[0].data
+        Y_test[i,:] = im.reshape((1,-1))
+
+        filename = os.environ['SCRATCH'] + "/CASA_IMS/clean_im_sim_" + "%03d" % (i+1) + '.fits'
+        hdulist = fits.open(filename)
+        im = hdulist[0].data
+        Y_CLEAN[i,:] = im.reshape((1,-1))
 
 
-                                ARCS = np.array(Image.open(arc_filename),dtype='float32').reshape(numpix_side*numpix_side,)/65535.0
+
+#file_list = []
+#n = 0
+#for file in os.listdir( os.environ['SCRATCH'] + "/CLEAN_DATA/fits_DIM" ):
+#    if file.startswith("dirty_im"):
+#        #print(file)
+#	file_list.insert( 0 , file)
+#	n = n + 1
+
+#def read_train_data_batch( X , PSF , Y_test  ):
+#    batch_size = len(X)
+#    max_file_num = len(file_list)
+#    inds = range(batch_size)
+#    for i in range(batch_size):
+#	pick_file = np.random.randint(0, high = max_file_num)
+#	file_num = file_list[pick_file][13:19]
+
+#        filename = os.environ['SCRATCH'] + '/CLEAN_DATA/fits_DIM/dirty_im_sim_' + file_num + '.fits'
+#        hdulist = fits.open(filename)
+#        im = hdulist[0].data
+
+#        filename = os.environ['SCRATCH'] + '/CLEAN_DATA/fits_DIM/dirty_noise_sim_' + file_num + '.fits'
+#        hdulist = fits.open(filename)
+#        noise = hdulist[0].data
+
+#	im = im / np.max(im)
+#	im = im + np.random.uniform(low=max_noise_rms/100, high=max_noise_rms) * noise
+#        X[i,:] = im.reshape((1,-1))
+
+#        filename = os.environ['SCRATCH'] + '/CLEAN_DATA/fits_PSF/psf_sim_' + file_num + '.fits'
+#        hdulist = fits.open(filename)
+#        im = hdulist[0].data
+#        PSF[i,:] = im.reshape((1,-1))
+
+#        filename = os.environ['SCRATCH'] + '/CLEAN_DATA/sky_images/im_' + file_num + '.fits'
+#        hdulist = fits.open(filename)
+#        im = hdulist[0].data
+#        Y_test[i,:] = im.reshape((1,-1))
 
 
-                ARCS_SHIFTED, lensXY , m_shift, n_shift = pick_new_lens_center(ARCS,Y[i,:], xy_range = max_xy_range)
 
-                ARCS = np.copy(ARCS_SHIFTED).reshape(numpix_side,numpix_side)
+#def read_CASA_test_data_batch( X , PSF , Y_test , Y_CLEAN ):
+#    batch_size = len(X)
+#    inds = range(batch_size)
+#    for i in range(batch_size):
+#        filename = os.environ['SCRATCH'] + "/CASA_IMS/im_" + "%03d" % (i+1) + '.fits'
+#        hdulist = fits.open(filename)
+#        im = hdulist[0].data
+
+#	im = im.reshape((-1,1))
+#        im_telescope = np.copy(im)
+#        im_telescope = im_telescope.reshape((numpix_side,numpix_side))
+
+#        FT_im =  np.fft.fftshift(np.fft.fft2(np.fft.fftshift(im_telescope)) )
+
+#        UV_im =  Nature_W * FT_im
+#        DT_im =  np.real( np.fft.ifftshift( np.fft.ifft2( np.fft.ifftshift(UV_im) ) ) )
+#        DT_im = DT_im / np.max(DT_im)
+
+#        DT_BEAM =  np.real( np.fft.ifftshift( np.fft.ifft2( np.fft.ifftshift(UVGRID) ) ) )
+
+#        FFT_NOISE = (np.random.normal(loc=0.0, scale = np.sqrt(Nvar) )  + np.random.normal(loc=0.0, scale = np.sqrt(Nvar)  ) *1j)
+
+#        noise_map = make_real_noise(FFT_NOISE)
+
+#        rnd_noise_rms = np.random.uniform(low=max_noise_rms/100, high=max_noise_rms)
+#        dirty_im_noisy = DT_im + (rnd_noise_rms * noise_map)
+#        im_telescope = dirty_im_noisy
+#        im_telescope = im_telescope.reshape((-1,1))
+
+#        if np.any(im>0.4):
+#                val_to_normalize = np.max(im_telescope[im>0.4])
+#                if val_to_normalize==0:
+#                        val_to_normalize = 1.0
+#                int_mult = np.random.normal(loc=1.0, scale = 0.01)
+#                im_telescope = (im_telescope / val_to_normalize) * int_mult
 
 
-                if (np.all(np.isnan(ARCS)==False)) and ((np.all(ARCS>=0)) and (np.all(np.isnan(Y[i,3:5])==False))) and ~np.all(ARCS==0):
-                        break
+#        X[i,:] = im_telescope.reshape((1,-1))
+#        PSF[i,:] = DT_BEAM.reshape((1,-1))
+#        Y_test[i,:] = im.reshape((1,-1))
 
-	    #rand_state = np.random.get_state()
 
-	    im_telescope = np.copy(ARCS)
-	    im_telescope = im_telescope.reshape((numpix_side,numpix_side))
+#        filename = os.environ['SCRATCH'] + "/CASA_IMS/clean_im_sim_" + "%03d" % (i+1) + '.fits'
+#        hdulist = fits.open(filename)
+#        im = hdulist[0].data
+#        Y_CLEAN[i,:] = im.reshape((1,-1))
 
-	    UVGRID,db = get_new_UVGRID_and_db(pix_res,numpix_side*2,deposit_order=0,antennaconfig=uvconfig)
 
-	    if np.any(ARCS>0.4):
-		    val_to_normalize = np.max(im_telescope[ARCS>0.4])
-		    if val_to_normalize==0:
-			    val_to_normalize = 1.0
-		    int_mult = np.random.normal(loc=1.0, scale = 0.01)
-		    im_telescope = (im_telescope / val_to_normalize) * int_mult
 
-	    noise_scl = np.random.uniform(max_noise_rms/100.,max_noise_rms)
-#           noise[i,:] = np.random.normal(0.0,noise_scl*np.max(im_telescope)*np.sqrt(2),UVGRID.shape).reshape(1,2*numpix_side,2*numpix_side\,1)                                                                                                                                     
+#def read_SLACS_data_batch( X , Y ):
+#    batch_size = len(X)
+#    for i in range(12):
+#        filename1 = os.environ['SCRATCH'] + "/SLACS_txt/test_0000001_1.txt"
+#        im =  np.loadtxt(filename1)
+#        X[i,:] = im.reshape((1,-1))
+#    Y_all = np.loadtxt(os.environ['SCRATCH'] + "/SLACS_txt/parameters_test.txt").reshape((1,-1))
+#    Y[:,:] = np.matlib.repmat(Y_all[:,0:5], 12 , 1)
 
-	    dim_telescope = np.fft.ifft2(np.fft.fft2(np.pad(im_telescope,[[numpix_side/2,numpix_side/2],[numpix_side/2,numpix_side/2]],mode='constant',constant_values=0.))*np.fft.fftshift(UVGRID>0)).real
-	    noise_realization = np.random.normal(0.0,1.0,UVGRID.shape)
-	    noise_dty = np.fft.ifft2(np.fft.fft2(noise_realization)/np.sqrt(np.fft.fftshift(UVGRID)+10**-8)*(np.fft.fftshift(UVGRID>0))).real
-	    noise[i,:] = noise_realization.reshape(1,2*numpix_side,2*numpix_side,1) * np.max(dim_telescope)/np.std(noise_dty) / np.sqrt(2) * noise_scl
 
-	    
 
-	    X[i,:] = im_telescope.reshape((1,-1))
-	    PSF[i,:] = np.fft.fftshift(UVGRID).reshape((1,numpix_side*2,numpix_side*2,1))
-	    Y[i,3] = lensXY[0]
-	    Y[i,4] = lensXY[1]
 
-	    #np.random.set_state(rand_state)
-	    
-	    print np.max(X[i,:]),PSF[i,:].shape
 
-    return X,Y,PSF,noise
+
+
+
+
+
+def gen_circle( X , Y ):
+	coord_rot_angle = -45 * np.pi/180
+	R = np.array([ [cos(coord_rot_angle) , sin(coord_rot_angle)] , [-sin(coord_rot_angle) , cos(coord_rot_angle)] ] )
+	R = 1.0
+	ex = np.array([1,0]).reshape([2,1])
+	ey = np.array([0,1]).reshape([2,1])
+	Tey = np.matmul(R, ey)
+	T = np.concatinate( (ex,ey) , axis=1 )
+	tilted_coords = np.concatinate( ( X.reshape((1,-1)) , Y.reshape((1,-1)) ) , axis=0 )
+
+	orthog_coords = np.matmul( T , tilted_coords );
+	x_orthog = orthog_coords[0,:] 
+	y_orthog = orthog_coords[1,:]
+
+	batch_size = len(x_new)
+	circle = 1.0
+	for i in range(batch_size):
+                r_c = np.sqrt( (xv- x_orthog[i]  )**2 + (yv- y_orthog[i] )**2 )
+                circle_rad = 0.2
+                circle = circle * np.float32(r_c<=circle_rad)
+
+		X[i,:] = circle.reshape((1,-1))
+		Y[i,:] = np.array([x_1 , x_2 , y_1 , y_2])
+       
+
+
+
+
+
+
+#def write_im_fits( N ):
+#    batch_size = N
+#    inds = range(batch_size)
+#    np.random.seed(seed=2)
+#    d_path = [[],[]]
+#    d_path[0] = test_data_path_1
+#    d_path[1] = test_data_path_2
+
+#    for i in range(batch_size):
+
+#	print i
+#        while True:
+#                ARCS=1
+#                nt = 0
+#                while np.min(ARCS)==1 or np.max(ARCS)<0.4:
+#                        nt = nt + 1
+#                        if nt>1:
+#                                inds[i] = np.random.randint(0, high = max_file_num)
+
+
+
+#                        pick_folder = np.random.randint(0, high = num_data_dirs)
+#                        arc_filename = d_path[pick_folder] +  'train_' + "%07d" % (inds[i]+1) + '.png'
+
+
+
+#                        ARCS = np.array(Image.open(arc_filename),dtype='float32').reshape(numpix_side*numpix_side,)/65535.0
+
+                #ARCS_SHIFTED, lensXY , m_shift, n_shift = pick_new_lens_center(ARCS,Y[i,:], xy_range = max_xy_range)
+                #ARCS = np.copy(ARCS_SHIFTED)
+
+
+#                if (np.all(np.isnan(ARCS)==False)) and (np.all(ARCS>=0)) and ~np.all(ARCS==0):
+#                        break
+
+
+#        im_telescope = np.copy(ARCS)
+#        im_telescope = im_telescope.reshape((numpix_side,numpix_side))
+
+
+
+#        val_to_normalize = np.max(im_telescope)
+#        if val_to_normalize==0:
+#            val_to_normalize = 1.0
+#        im_telescope = (im_telescope / val_to_normalize) 
+
+#	hdu = fits.PrimaryHDU(im_telescope)
+#	hdulist = fits.HDUList([hdu])
+#	hdulist.writeto( os.environ['LOCAL_SCRATCH'] +  '/sky_images/im_' +  "%0.6d"%i  +'.fits')
 
 def load_binary(binaryfile):
-	'''
-	We find it convenient to store our ALMA datasets as binary files.
-	For this reason, it is nice to have a function to read them quickly.
-	'''
 	with open(binaryfile,'rb') as file:
 		filecontent = file.read()
 		data = np.array(struct.unpack("d"*(len(filecontent)//8),filecontent))
@@ -364,10 +529,12 @@ def get_binned_visibilities(u,v,vis,pix_res,num_pixels):
     A:     The noise scaling.
     
     '''
-    # these are the coordinates of the edges of grid cells in Fourier space.
+    
     kvec = np.fft.fftshift(np.fft.fftfreq(num_pixels,pix_res/3600./180.*np.pi))
     kvec -= (kvec[1]-kvec[0])/2.
     kvec = np.append(kvec,kvec[-1]+(kvec[1]-kvec[0]))
+    
+    print np.sum(np.isclose((kvec[1:]+kvec[:-1])/2.,0))
     
     # Count number of visibilities in each bin
     P,reject1,reject2 = np.histogram2d(u,v,bins=kvec)
@@ -386,30 +553,36 @@ def get_binned_visibilities(u,v,vis,pix_res,num_pixels):
     indI = np.zeros(u.shape,int)
     
     
-    # loop over bins... yes I know its slow.
+    # loop over bins
     for i in range(len(row)):
         
         # indices of visibilities in the bin
         inds = np.where((v>=kvec[col[i]]) & (v<kvec[col[i]+1]) & \
                         (u>=kvec[row[i]]) & (u<kvec[row[i]+1]))[0]
         
+
+        
         vis_gridded[col[i],row[i]] +=np.sum(vis[inds])
     
-    for i in range(len(row2)): # we secretly also sample visibilities at (-u , -v) 
+    for i in range(len(row2)):
         
         # indices of visibilities in the bin
         inds = np.where((-v>=kvec[col2[i]]) & (-v<kvec[col2[i]+1]) & \
                         (-u>=kvec[row2[i]]) & (-u<kvec[row2[i]+1]))[0]
         
+    
+        
         vis_gridded[col2[i],row2[i]] +=np.sum(np.conj(vis[inds]))
     
-    # get average by division.  Avoid NaNs.    
+    # get average by division
+    #vis_gridded[np.where(P+P2 !=0)] /= (P+P2)[np.where(P+P2 !=0)].astype('float')
+    
     vis_gridded /= (P.T+P2.T+1e-8)
     vis_gridded[np.abs(vis_gridded)<1e-6] *=0
 
     return (P+P2).T , vis_gridded
 
-def get_gridded_visibilities(directory_name,pix_res,num_pixels):
+def get_gridded_visibilities(directory_name,pix_res,num_pixels,phasecenter=[0.,0.],newRipples=False):
 	'''
 	Load visibilities from a file, and then produce the gridded (averaged in grid cells) 
 	visibilities and uv mask that can be fed to the likelihood object)
@@ -420,17 +593,27 @@ def get_gridded_visibilities(directory_name,pix_res,num_pixels):
 	vis = load_binary(directory_name+'vis_chan_0.bin')
 	vis = vis[::2]+1j*vis[1::2]
 
-	# grid the visibilities
+	if newRipples is True:
+		freq = load_binary(directory_name+'frequencies.bin')
+		wav =  (3.*10**8) / freq
+		u /= wav
+		v /= wav
+	print(np.max(np.sqrt(u**2+v**2)))
+	vis = shift_phase_center(u,v,vis,phasecenter)
+	print(np.max(np.abs(vis)))
 	UVGRID , vis_gridded = get_binned_visibilities(u,v,vis,pix_res,num_pixels)
-	
+
 	return np.fft.fftshift(UVGRID).reshape([1,num_pixels,num_pixels,1]) , np.fft.fftshift(vis_gridded).reshape([1,num_pixels,num_pixels,1])
 
 
+def shift_phase_center(u,v,vis,phase_center):
+	'''
+	Shift the center of the ALMA pointing to a new phase center.  Phase center shift 
+	is defined in arcseconds.
+	'''
+	ushift = phase_center[0]*u / 3600. / 180. * np.pi
+	vshift = phase_center[1]*v / 3600. / 180. * np.pi
+	phaseshift = ushift + vshift
 
-def read_CLEAN_data_batch( X , Y , max_file_num ):
-	for i in range(X.shape[0]):
-		dir_num = np.random.randint(0,9)
-		file_num = np.random.randint(0,max_file_num)
-
-		X[i,:] = np.load(CLEAN_data_paths[dir_num]+'train_%07d.npy'%(file_num)).reshape(numpix_side*numpix_side)
-		Y[i,:8] = Y_CLEAN_train[dir_num][file_num,:]
+	vis_shifted = vis * np.exp(2j*np.pi*phaseshift)
+	return vis_shifted
